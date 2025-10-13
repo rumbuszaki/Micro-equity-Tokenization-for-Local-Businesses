@@ -5,6 +5,14 @@
 (define-constant ERR-INVALID-AMOUNT (err u400))
 (define-constant ERR-ALREADY-EXISTS (err u409))
 
+(define-constant ERR-PROPOSAL-NOT-FOUND (err u410))
+(define-constant ERR-ALREADY-VOTED (err u411))
+(define-constant ERR-VOTING-ENDED (err u412))
+(define-constant ERR-PROPOSAL-NOT-PASSED (err u413))
+(define-constant ERR-MIN-SHARES-REQUIRED (err u414))
+
+(define-data-var next-proposal-id uint u0)
+
 (define-data-var contract-owner principal tx-sender)
 (define-data-var next-business-id uint u0)
 
@@ -204,4 +212,103 @@
 
 (define-read-only (get-total-businesses)
   (var-get next-business-id)
+)
+
+
+(define-map proposals
+  { proposal-id: uint }
+  {
+    business-id: uint,
+    proposer: principal,
+    description: (string-ascii 200),
+    votes-for: uint,
+    votes-against: uint,
+    voting-deadline: uint,
+    executed: bool,
+    min-approval-rate: uint
+  }
+)
+
+(define-map shareholder-votes
+  { proposal-id: uint, voter: principal }
+  { vote-weight: uint, vote-for: bool }
+)
+
+(define-public (create-proposal 
+  (business-id uint) 
+  (description (string-ascii 200)) 
+  (voting-duration uint) 
+  (min-approval-rate uint))
+  (let (
+    (proposal-id (+ (var-get next-proposal-id) u1))
+    (voter-shares (get-shares business-id tx-sender))
+  )
+    (asserts! (> voter-shares u0) ERR-MIN-SHARES-REQUIRED)
+    (asserts! (is-some (map-get? businesses { business-id: business-id })) ERR-BUSINESS-NOT-FOUND)
+    (map-set proposals
+      { proposal-id: proposal-id }
+      {
+        business-id: business-id,
+        proposer: tx-sender,
+        description: description,
+        votes-for: u0,
+        votes-against: u0,
+        voting-deadline: (+ stacks-block-height voting-duration),
+        executed: false,
+        min-approval-rate: min-approval-rate
+      }
+    )
+    (var-set next-proposal-id proposal-id)
+    (ok proposal-id)
+  )
+)
+
+(define-public (cast-vote (proposal-id uint) (vote-for bool))
+  (let (
+    (proposal (unwrap! (map-get? proposals { proposal-id: proposal-id }) ERR-PROPOSAL-NOT-FOUND))
+    (voter-shares (get-shares (get business-id proposal) tx-sender))
+    (existing-vote (map-get? shareholder-votes { proposal-id: proposal-id, voter: tx-sender }))
+  )
+    (asserts! (> voter-shares u0) ERR-MIN-SHARES-REQUIRED)
+    (asserts! (is-none existing-vote) ERR-ALREADY-VOTED)
+    (asserts! (< stacks-block-height (get voting-deadline proposal)) ERR-VOTING-ENDED)
+    (map-set shareholder-votes
+      { proposal-id: proposal-id, voter: tx-sender }
+      { vote-weight: voter-shares, vote-for: vote-for }
+    )
+    (map-set proposals
+      { proposal-id: proposal-id }
+      (if vote-for
+        (merge proposal { votes-for: (+ (get votes-for proposal) voter-shares) })
+        (merge proposal { votes-against: (+ (get votes-against proposal) voter-shares) })
+      )
+    )
+    (ok true)
+  )
+)
+
+(define-read-only (get-proposal (proposal-id uint))
+  (map-get? proposals { proposal-id: proposal-id })
+)
+
+(define-read-only (get-voter-ballot (proposal-id uint) (voter principal))
+  (map-get? shareholder-votes { proposal-id: proposal-id, voter: voter })
+)
+
+(define-read-only (get-proposal-result (proposal-id uint))
+  (match (map-get? proposals { proposal-id: proposal-id })
+    proposal
+      (let (
+        (total-votes (+ (get votes-for proposal) (get votes-against proposal)))
+        (approval-rate (if (> total-votes u0) (/ (* (get votes-for proposal) u100) total-votes) u0))
+      )
+        (ok { 
+          passed: (>= approval-rate (get min-approval-rate proposal)),
+          approval-rate: approval-rate,
+          votes-for: (get votes-for proposal),
+          votes-against: (get votes-against proposal)
+        })
+      )
+    ERR-PROPOSAL-NOT-FOUND
+  )
 )
