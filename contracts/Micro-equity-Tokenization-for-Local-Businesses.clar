@@ -11,6 +11,12 @@
 (define-constant ERR-PROPOSAL-NOT-PASSED (err u413))
 (define-constant ERR-MIN-SHARES-REQUIRED (err u414))
 
+(define-constant ERR-VESTING-NOT-FOUND (err u415))
+(define-constant ERR-NO-VESTED-SHARES (err u416))
+(define-constant ERR-VESTING-EXISTS (err u417))
+
+(define-data-var next-vesting-id uint u0)
+
 (define-data-var next-proposal-id uint u0)
 
 (define-data-var contract-owner principal tx-sender)
@@ -311,4 +317,116 @@
       )
     ERR-PROPOSAL-NOT-FOUND
   )
+)
+
+(define-map vesting-schedules
+  { vesting-id: uint }
+  {
+    business-id: uint,
+    beneficiary: principal,
+    total-shares: uint,
+    claimed-shares: uint,
+    start-block: uint,
+    cliff-duration: uint,
+    vesting-duration: uint,
+    revoked: bool
+  }
+)
+
+(define-map beneficiary-vesting
+  { business-id: uint, beneficiary: principal }
+  { vesting-id: uint }
+)
+
+(define-public (create-vesting-schedule
+  (business-id uint)
+  (beneficiary principal)
+  (total-shares uint)
+  (cliff-duration uint)
+  (vesting-duration uint))
+  (let (
+    (business (unwrap! (map-get? businesses { business-id: business-id }) ERR-BUSINESS-NOT-FOUND))
+    (is-owner (unwrap! (map-get? business-owners { owner: tx-sender, business-id: business-id }) ERR-NOT-AUTHORIZED))
+    (owner-shares (get-shares business-id tx-sender))
+    (vesting-id (+ (var-get next-vesting-id) u1))
+    (existing-vesting (map-get? beneficiary-vesting { business-id: business-id, beneficiary: beneficiary }))
+  )
+    (asserts! (get authorized is-owner) ERR-NOT-AUTHORIZED)
+    (asserts! (> total-shares u0) ERR-INVALID-AMOUNT)
+    (asserts! (>= owner-shares total-shares) ERR-INSUFFICIENT-BALANCE)
+    (asserts! (< cliff-duration vesting-duration) ERR-INVALID-AMOUNT)
+    (asserts! (is-none existing-vesting) ERR-VESTING-EXISTS)
+    (map-set vesting-schedules
+      { vesting-id: vesting-id }
+      {
+        business-id: business-id,
+        beneficiary: beneficiary,
+        total-shares: total-shares,
+        claimed-shares: u0,
+        start-block: stacks-block-height,
+        cliff-duration: cliff-duration,
+        vesting-duration: vesting-duration,
+        revoked: false
+      }
+    )
+    (map-set beneficiary-vesting
+      { business-id: business-id, beneficiary: beneficiary }
+      { vesting-id: vesting-id }
+    )
+    (map-set equity-tokens
+      { business-id: business-id, holder: tx-sender }
+      { shares: (- owner-shares total-shares) }
+    )
+    (var-set next-vesting-id vesting-id)
+    (ok vesting-id)
+  )
+)
+
+(define-public (claim-vested-shares (vesting-id uint))
+  (let (
+    (schedule (unwrap! (map-get? vesting-schedules { vesting-id: vesting-id }) ERR-VESTING-NOT-FOUND))
+    (vested-amount (unwrap! (get-vested-amount vesting-id) ERR-VESTING-NOT-FOUND))
+    (claimable-shares (- vested-amount (get claimed-shares schedule)))
+  )
+    (asserts! (is-eq tx-sender (get beneficiary schedule)) ERR-NOT-AUTHORIZED)
+    (asserts! (not (get revoked schedule)) ERR-TRANSFER-RESTRICTED)
+    (asserts! (> claimable-shares u0) ERR-NO-VESTED-SHARES)
+    (map-set vesting-schedules
+      { vesting-id: vesting-id }
+      (merge schedule { claimed-shares: vested-amount })
+    )
+    (map-set equity-tokens
+      { business-id: (get business-id schedule), holder: tx-sender }
+      { shares: (+ (get-shares (get business-id schedule) tx-sender) claimable-shares) }
+    )
+    (ok claimable-shares)
+  )
+)
+
+(define-read-only (get-vested-amount (vesting-id uint))
+  (match (map-get? vesting-schedules { vesting-id: vesting-id })
+    schedule
+      (let (
+        (elapsed-blocks (- stacks-block-height (get start-block schedule)))
+        (cliff-duration (get cliff-duration schedule))
+        (vesting-duration (get vesting-duration schedule))
+        (total-shares (get total-shares schedule))
+      )
+        (if (get revoked schedule)
+          (ok (get claimed-shares schedule))
+          (if (< elapsed-blocks cliff-duration)
+            (ok u0)
+            (if (>= elapsed-blocks vesting-duration)
+              (ok total-shares)
+              (ok (/ (* total-shares elapsed-blocks) vesting-duration))
+            )
+          )
+        )
+      )
+    (err u404)
+  )
+)
+
+(define-read-only (get-vesting-schedule (vesting-id uint))
+  (map-get? vesting-schedules { vesting-id: vesting-id })
 )
